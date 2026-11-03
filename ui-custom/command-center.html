@@ -43,6 +43,9 @@
   #log { font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted); max-height: 150px; overflow-y: auto; }
   #log div b { color: var(--text); font-weight: 500; }
   textarea { width: 100%; height: 56px; background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: 11px ui-monospace, monospace; padding: 6px; resize: vertical; }
+  .bar { height: 6px; border-radius: 4px; background: var(--panel2); overflow: hidden; margin: 6px 0; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  button.on { border-color: var(--warn); color: var(--warn); }
   .count { display: flex; align-items: baseline; gap: 12px; }
   .count .num { font-size: 44px; font-weight: 750; line-height: 1; color: var(--accent); min-width: 34px; }
   .count .num.unstable { color: var(--warn); }
@@ -81,10 +84,19 @@
       <div><label for="roomD">Depth (y)</label><input id="roomD" type="number" min="1" max="30" step="0.1"></div>
     </div>
 
+    <h2>Train location</h2>
+    <div class="hint" id="fpStatus">–</div>
+    <button id="fpEmpty" style="width:100%;margin-top:6px">1. Record empty room (10 s)</button>
+    <button id="fpSpot" style="width:100%;margin-top:6px">2. Record yourself at a spot</button>
+    <div class="bar"><i id="fpBar"></i></div>
+    <div class="hint" id="fpMsg">Do step 1 with nobody in the room. For step 2, stand still, click “Record yourself”, then click your position on the map.</div>
+    <button id="fpClear" class="danger" style="width:100%;margin-top:6px">Clear training data</button>
+
     <h2>Person location</h2>
     <label for="mode">Method</label>
     <select id="mode" style="width:100%">
       <option value="link">Link model (router → boards)</option>
+      <option value="fingerprint">Trained fingerprint (best, needs training)</option>
       <option value="server">Server signal field</option>
     </select>
     <div class="hint" id="routerHint" style="margin-top:6px">Place the <b>Router</b> object where your router really is. Each board's link runs from the router to that board; the person is placed where the disturbed links point.</div>
@@ -144,6 +156,7 @@
   </aside>
 </main>
 
+<script src="fingerprint.js"></script>
 <script>
 (() => {
   'use strict';
@@ -166,6 +179,7 @@
     amp: {},                // node_id -> amplitude history
     lastMsg: 0,
     mode: store.get('cc.mode', 'link'),
+    rec: null, armed: false, vecWin: [], curVec: null, fpHist: [], fpEst: null, fpVal: null, spotList: [],
     pl: store.get('cc.pl', { rssi0: -45, n: 2.7 }),
     mbp: {},
     score: {},
@@ -223,6 +237,79 @@
     $('iDel').onclick = () => { state.objects = state.objects.filter(x => x !== o); state.selected = null; save(); renderInspector(); };
   }
   renderInspector();
+
+  // ---------- fingerprint training ----------
+  const FP = window.Fingerprint;
+  state.fp = (() => { try { const j = store.get('cc.fp', null); return j ? FP.Fingerprinter.fromJSON(j) : new FP.Fingerprinter(); } catch { return new FP.Fingerprinter(); } })();
+
+  function updateVec(m) {
+    const by = {};
+    for (const n of (m.nodes || [])) if (Array.isArray(n.amplitude) && n.amplitude.length >= 8) by[n.node_id] = n.amplitude;
+    const ids = state.fp.nodeIds.length ? state.fp.nodeIds : (m.nodes || []).map(n => n.node_id).sort((a, b) => a - b);
+    const v = FP.featurize(by, ids); if (!v) return;
+    state.vecWin.push(v); if (state.vecWin.length > 5) state.vecWin.shift();
+    if (state.vecWin.length === 5) state.curVec = FP.average(state.vecWin);
+  }
+  function renderFp() {
+    const f = state.fp; let t = `${f.spots()} spots · ${f.emptyCount()} empty samples`;
+    state.spotList = [];
+    if (f.samples.length) {
+      f.fit(); const seen = new Set();
+      for (const x of f.samples) if (x.label !== FP.EMPTY) { const k = x.x + ',' + x.y; if (!seen.has(k)) { seen.add(k); state.spotList.push({ x: x.x, y: x.y, blind: !!x.blind }); } }
+    }
+    if (f.ready()) {
+      const bl = f.blindList().length; t += ` · <span style="color:var(--bad)">${bl} blind spot${bl === 1 ? '' : 's'}</span>`;
+      const v = state.fpVal || f.validate(); state.fpVal = v;
+      if (v) t += `<br>Accuracy measured on your data:<br>• trained spots: ${v.timeErr != null ? v.timeErr.toFixed(2) + ' m' : '–'}<br>• spots you did NOT record: ${v.unseenErr != null ? v.unseenErr.toFixed(2) + ' m' : '–'}<br>• empty vs occupied: ${v.emptyAcc != null ? Math.round(v.emptyAcc * 100) + '%' : '–'}`;
+    } else t += '<br>Need an empty-room recording and at least 3 spots.';
+    $('fpStatus').innerHTML = t;
+  }
+  function fpMsg(txt) { $('fpMsg').textContent = txt; }
+  function startRec(kind, x, y) {
+    const live = state.latest && (state.latest.nodes || []).length >= 2;
+    if (!live || !state.curVec) { fpMsg('Need both boards streaming first — wait a few seconds and try again.'); state.armed = false; $('fpSpot').classList.remove('on'); return; }
+    const ids = state.latest.nodes.map(n => n.node_id).sort((a, b) => a - b);
+    if (!state.fp.nodeIds.length) state.fp.nodeIds = ids;
+    else if (state.fp.nodeIds.join() !== ids.join()) { fpMsg('The set of boards changed since the last recording. Clear training data and start again.'); return; }
+    const now = performance.now(), dur = kind === 'empty' ? 10000 : 8000;
+    state.rec = { kind, x, y, t0: now + 3000, t1: now + 3000 + dur, last: 0, n: 0 };
+    state.armed = false; $('fpSpot').classList.remove('on');
+  }
+  function recSample(now) {
+    const r = state.rec; if (!r || !state.curVec || now < r.t0 || now >= r.t1 || now - r.last < 200) return;
+    r.last = now; r.n++;
+    state.fp.add(r.kind === 'empty' ? FP.EMPTY : 'pos', r.x || 0, r.y || 0, state.curVec);
+  }
+  function recTick(now) {
+    const r = state.rec; if (!r) return;
+    if (now < r.t0) { fpMsg(`Get ready — recording in ${Math.ceil((r.t0 - now) / 1000)} s. ${r.kind === 'empty' ? 'Leave the room / stay out of the way.' : 'Stand still.'}`); $('fpBar').style.width = '0'; }
+    else if (now < r.t1) { fpMsg(`Recording… ${Math.ceil((r.t1 - now) / 1000)} s — ${r.kind === 'empty' ? 'room must be empty' : 'don’t move'}`); $('fpBar').style.width = ((now - r.t0) / (r.t1 - r.t0) * 100) + '%'; }
+    else {
+      state.rec = null; $('fpBar').style.width = '0';
+      if (r.n < 5) { fpMsg('Not enough data was captured — try again.'); return; }
+      state.fp._fitted = false; state.fp.fit(); state.fpVal = null; store.set('cc.fp', state.fp.toJSON()); renderFp();
+      fpMsg(r.kind === 'empty' ? 'Empty room recorded. Now record yourself at several spots (6+ spread around the room works best).' : `Spot recorded (${r.n} samples). Add more spots, mainly where you actually walk.`);
+    }
+  }
+  function fpPredict() {
+    if (state.mode !== 'fingerprint') return;
+    if (state.fp.ready() && state.curVec && !state.rec) {
+      const r = state.fp.predict(state.curVec);
+      state.fpHist.push(r); if (state.fpHist.length > 8) state.fpHist.shift();
+      const occ = state.fpHist.filter(h => !h.empty && h.x != null);
+      if (occ.length / state.fpHist.length < 0.4) { if (state.fpEst) state.fpEst.s *= 0.85; }
+      else {
+        const mx = occ.reduce((a, h) => a + h.x, 0) / occ.length, my = occ.reduce((a, h) => a + h.y, 0) / occ.length;
+        const sp = occ.reduce((a, h) => a + h.spread, 0) / occ.length;
+        state.fpEst = (state.fpEst && state.fpEst.s > 0.2) ? { x: state.fpEst.x + (mx - state.fpEst.x) * 0.3, y: state.fpEst.y + (my - state.fpEst.y) * 0.3, s: 1, spread: sp } : { x: mx, y: my, s: 1, spread: sp };
+      }
+    }
+    state.est = state.fpEst;
+  }
+  $('fpEmpty').onclick = () => startRec('empty', 0, 0) || fpMsg('Leave the room now…');
+  $('fpSpot').onclick = () => { state.armed = !state.armed; $('fpSpot').classList.toggle('on', state.armed); fpMsg(state.armed ? 'Stand still where you want to record, then click your position on the map.' : ''); };
+  $('fpClear').onclick = () => { if (confirm('Delete all training recordings?')) { state.fp.clear(); state.fp.nodeIds = []; state.fpVal = null; state.fpEst = null; state.fpHist = []; store.set('cc.fp', state.fp.toJSON()); renderFp(); fpMsg('Cleared.'); } };
+  renderFp();
 
   // ---------- distances ----------
   $('rssi0').value = state.pl.rssi0; $('plexp').value = state.pl.n;
@@ -403,6 +490,7 @@
 
     updateLinkModel(m);
     if (state.mode === 'link') state.est = state.linkEst;
+    updateVec(m); recSample(performance.now()); fpPredict();
 
     // headline
     const ri = m.room_inference || {};
@@ -516,7 +604,7 @@
 
   function frame(now) {
     requestAnimationFrame(frame);
-    updateDistances(now);
+    updateDistances(now); recTick(performance.now());
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     const v = view();
@@ -571,13 +659,24 @@
     if (live && state.est && state.est.s > 0.05) {
       const [px, py] = toPx(v, state.est.x, state.est.y);
       const pulse = 1 + 0.15 * Math.sin(now / 250);
-      const rad = (state.mode === 'link' ? 0.9 : 0.35 + state.est.s * 0.5) * v.s * pulse;
+      const rad = (state.mode === 'link' ? 0.9 : state.mode === 'fingerprint' ? Math.max(0.35, state.est.spread || 0) : 0.35 + state.est.s * 0.5) * v.s * pulse;
       const gr = ctx.createRadialGradient(px, py, 0, px, py, rad);
       gr.addColorStop(0, 'rgba(255,184,77,0.55)'); gr.addColorStop(1, 'rgba(255,184,77,0)');
       ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(px, py, rad, 0, 7); ctx.fill();
       ctx.fillStyle = '#ffb84d'; ctx.beginPath(); ctx.arc(px, py, 6, 0, 7); ctx.fill();
       ctx.fillStyle = '#ffb84d'; ctx.font = '11px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-      ctx.fillText(state.mode === 'link' ? 'person (rough area)' : 'presence (approx.)', px, py - 12);
+      ctx.fillText(state.mode === 'link' ? 'person (rough area)' : state.mode === 'fingerprint' ? 'person (trained)' : 'presence (approx.)', px, py - 12);
+    }
+
+    // training spots (green = usable, red = blind spot) and the recording ring
+    for (const sp of state.spotList) {
+      const [px, py] = toPx(v, sp.x, sp.y);
+      ctx.strokeStyle = sp.blind ? '#ff5d6c' : '#36d6a4'; ctx.globalAlpha = 0.7; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(px, py, 5, 0, 7); ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (state.rec && state.rec.kind === 'spot') {
+      const [px, py] = toPx(v, state.rec.x, state.rec.y), rec = performance.now() >= state.rec.t0;
+      ctx.strokeStyle = rec ? '#ff5d6c' : '#ffb84d'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, 12 + 3 * Math.sin(now / 150), 0, 7); ctx.stroke();
     }
 
     // nodes
@@ -621,6 +720,7 @@
   }
   cv.addEventListener('pointerdown', e => {
     const r = cv.getBoundingClientRect(); const mx = e.clientX - r.left, my = e.clientY - r.top; const v = view();
+    if (state.armed) { const [x, y] = toM(v, mx, my); startRec('spot', Math.min(state.room.w, Math.max(0, x)), Math.min(state.room.d, Math.max(0, y))); return; }
     const n = hitNode(v, mx, my);
     if (n) { const p = nodePos(n); const [x, y] = toM(v, mx, my); drag = { kind: 'node', n, dx: p[0] - x, dy: p[1] - y }; cv.setPointerCapture(e.pointerId); return; }
     const o = hitObject(v, mx, my);
