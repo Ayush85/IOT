@@ -20,7 +20,7 @@ Place nodes 2–4 m apart with the router; a person moving through the links cha
 - `scripts/udp_listen.py` – minimal UDP receiver to confirm frames arrive
 
 ## Status
-- [ ] Flash node 1, see CSI on serial
-- [ ] Provision WiFi + host IP, receive UDP on host
+- [x] Flash node 1, see CSI on serial
+- [x] Provision WiFi + host IP, receive UDP on host
 - [ ] Second node, compare links
 - [ ] Run RuView sensing server against live data
