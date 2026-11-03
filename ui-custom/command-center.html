@@ -123,6 +123,14 @@
     <div class="stat"><span>Breathing band power</span><span id="breath">–</span></div>
     <div class="stat"><span>Nodes contributing</span><span id="contrib">–</span></div>
 
+    <h2>Distances</h2>
+    <div id="dist"></div>
+    <div class="row">
+      <div><label for="rssi0">RSSI at 1 m (dBm)</label><input id="rssi0" type="number" step="1"></div>
+      <div><label for="plexp">Path-loss exponent</label><input id="plexp" type="number" step="0.1" min="1.5" max="5"></div>
+    </div>
+    <div class="hint" style="margin-top:6px"><b>Map</b> = straight line between the positions you placed (exact if placed correctly). <b>Signal</b> = estimate from WiFi strength: only a rough guide, off by 1–3 m or more indoors.</div>
+
     <h2>Boards</h2>
     <div id="nodes"></div>
 
@@ -158,6 +166,7 @@
     amp: {},                // node_id -> amplitude history
     lastMsg: 0,
     mode: store.get('cc.mode', 'link'),
+    pl: store.get('cc.pl', { rssi0: -45, n: 2.7 }),
     mbp: {},
     score: {},
     link: null,
@@ -214,6 +223,29 @@
     $('iDel').onclick = () => { state.objects = state.objects.filter(x => x !== o); state.selected = null; save(); renderInspector(); };
   }
   renderInspector();
+
+  // ---------- distances ----------
+  $('rssi0').value = state.pl.rssi0; $('plexp').value = state.pl.n;
+  $('rssi0').onchange = e => { state.pl.rssi0 = +e.target.value || -45; store.set('cc.pl', state.pl); };
+  $('plexp').onchange = e => { state.pl.n = +e.target.value || 2.7; store.set('cc.pl', state.pl); };
+  const sigDist = rssi => Math.pow(10, (state.pl.rssi0 - rssi) / (10 * state.pl.n));
+  const fmt = d => d.toFixed(2) + ' m';
+  let lastDist = 0;
+  function updateDistances(now) {
+    if (now - lastDist < 400 || !state.latest) return; lastDist = now;
+    const nodes = state.latest.nodes || [], rp = routerPos(); const rows = [];
+    if (nodes.length >= 2) {
+      const a = nodePos(nodes[0]), b = nodePos(nodes[1]);
+      rows.push(['Node ' + nodes[0].node_id + ' ↔ Node ' + nodes[1].node_id, fmt(Math.hypot(a[0] - b[0], a[1] - b[1], (a[2] || 0) - (b[2] || 0))), '–']);
+    }
+    for (const n of nodes) {
+      const p = nodePos(n);
+      if (rp) rows.push(['Router → Node ' + n.node_id, fmt(Math.hypot(p[0] - rp[0], p[1] - rp[1])), fmt(sigDist(n.rssi_dbm))]);
+      if (state.est && state.est.s > 0.15) rows.push(['You → Node ' + n.node_id + ' (approx.)', fmt(Math.hypot(p[0] - state.est.x, p[1] - state.est.y)), '–']);
+    }
+    $('dist').innerHTML = '<div class="stat"><span></span><span style="display:flex;gap:18px"><b>Map</b><b>Signal</b></span></div>' +
+      rows.map(r => `<div class="stat"><span>${r[0]}</span><span style="display:flex;gap:18px"><span style="color:var(--text);min-width:52px;text-align:right">${r[1]}</span><span style="color:var(--muted);min-width:52px;text-align:right">${r[2]}</span></span></div>`).join('');
+  }
 
   // ---------- location method ----------
   $('mode').value = state.mode;
@@ -484,6 +516,7 @@
 
   function frame(now) {
     requestAnimationFrame(frame);
+    updateDistances(now);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     const v = view();
@@ -520,6 +553,18 @@
       ctx.save(); ctx.setLineDash([8, 8]); ctx.lineDashOffset = -(now / 40) % 16;
       ctx.strokeStyle = d > 0.5 ? `rgba(255,184,77,${0.4 + d * 0.5})` : `rgba(54,214,164,${live ? 0.2 + q * 0.4 : 0.1})`; ctx.lineWidth = 1 + q * 2 + d * 2;
       ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke(); ctx.restore();
+    }
+
+    // dimension line between the first two boards (measured from the placed positions)
+    if (nodes.length >= 2) {
+      const pa = nodePos(nodes[0]), pb = nodePos(nodes[1]);
+      const a = toPx(v, pa[0], pa[1]), b = toPx(v, pb[0], pb[1]);
+      ctx.save(); ctx.setLineDash([2, 5]); ctx.strokeStyle = '#8b9bb0aa'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke(); ctx.restore();
+      const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], dm = Math.hypot(pa[0] - pb[0], pa[1] - pb[1]);
+      const txt = dm.toFixed(2) + ' m'; ctx.font = '600 12px system-ui'; const tw = ctx.measureText(txt).width + 12;
+      ctx.fillStyle = '#0b0f14e6'; roundRect(ctx, mid[0] - tw / 2, mid[1] - 10, tw, 20, 6); ctx.fill();
+      ctx.fillStyle = '#e6edf5'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(txt, mid[0], mid[1]);
     }
 
     // estimated presence
