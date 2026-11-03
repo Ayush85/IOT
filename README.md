@@ -15,6 +15,7 @@ camera-free presence / motion / breathing sensing from WiFi Channel State Inform
 Place nodes 2–4 m apart with the router; a person moving through the links changes the CSI.
 
 ## Layout
+- `docs/HANDOVER.md` – **start here**: status, what works, how to run and rebuild, gotchas, next steps
 - `docs/setup.md` – step-by-step connection, flashing, validation
 - `firmware/` – CSI node firmware (use RuView's `firmware/esp32-csi-node` or Espressif `esp-csi`)
 - `scripts/udp_listen.py` – minimal UDP receiver to confirm frames arrive
