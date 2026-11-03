@@ -7,3 +7,4 @@ managed_components/
 *.bin
 .env
 vendor/
+run/
