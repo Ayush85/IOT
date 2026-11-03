@@ -18,6 +18,9 @@ Place nodes 2–4 m apart with the router; a person moving through the links cha
 - `docs/setup.md` – step-by-step connection, flashing, validation
 - `firmware/` – CSI node firmware (use RuView's `firmware/esp32-csi-node` or Espressif `esp-csi`)
 - `scripts/udp_listen.py` – minimal UDP receiver to confirm frames arrive
+- `scripts/run-server.sh` – starts the RuView sensing server
+- `ui-custom/command-center.html` – room map UI (live heatmap, boards, presence, draggable objects)
+- `config/room.env` – node positions in metres
 
 ## Status
 - [x] Flash node 1, see CSI on serial
