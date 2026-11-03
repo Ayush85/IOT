@@ -99,6 +99,12 @@
       <option value="fingerprint">Trained fingerprint (best, needs training)</option>
       <option value="server">Server signal field</option>
     </select>
+    <label for="profile" style="margin-top:8px">Response</label>
+    <select id="profile" style="width:100%">
+      <option value="fast">Fast — live, noisier</option>
+      <option value="balanced">Balanced — ~15 s lag</option>
+      <option value="accurate">Accurate — ~30 s lag, steadiest</option>
+    </select>
     <div class="hint" id="routerHint" style="margin-top:6px">Place the <b>Router</b> object where your router really is. Each board's link runs from the router to that board; the person is placed where the disturbed links point.</div>
 
     <h2>Layout</h2>
@@ -179,6 +185,7 @@
     amp: {},                // node_id -> amplitude history
     lastMsg: 0,
     mode: store.get('cc.mode', 'link'),
+    profile: store.get('cc.profile', 'accurate'), trainVec: null, curFill: 0, settling: false,
     rec: null, armed: false, vecWin: [], curVec: null, fpHist: [], fpEst: null, fpVal: null, spotList: [],
     pl: store.get('cc.pl', { rssi0: -45, n: 2.7 }),
     mbp: {},
@@ -240,6 +247,16 @@
 
   // ---------- fingerprint training ----------
   const FP = window.Fingerprint;
+  // win = frames averaged for one reading; hist = readings voted over; cnt = readings used for the people count; ema = marker smoothing; lag = seconds
+  const PROFILES = {
+    fast:     { win: 5,  hist: 8,   cnt: 60,  ema: 0.30, lag: 6 },
+    balanced: { win: 20, hist: 40,  cnt: 150, ema: 0.15, lag: 15 },
+    accurate: { win: 60, hist: 100, cnt: 300, ema: 0.08, lag: 30 },
+  };
+  const PROFILE = () => PROFILES[state.profile] || PROFILES.accurate;
+  $('profile').value = state.profile;
+  function applyProfile() { $('cntWarn').textContent = `Averaged over ~${PROFILE().lag} s. With 2 boards this is still a rough estimate, not a headcount.`; }
+  $('profile').onchange = e => { state.profile = e.target.value; store.set('cc.profile', state.profile); state.fpHist = []; state.fpEst = null; state.linkEst = null; hist.length = 0; applyProfile(); };
   state.fp = (() => { try { const j = store.get('cc.fp', null); return j ? FP.Fingerprinter.fromJSON(j) : new FP.Fingerprinter(); } catch { return new FP.Fingerprinter(); } })();
 
   function updateVec(m) {
@@ -247,8 +264,9 @@
     for (const n of (m.nodes || [])) if (Array.isArray(n.amplitude) && n.amplitude.length >= 8) by[n.node_id] = n.amplitude;
     const ids = state.fp.nodeIds.length ? state.fp.nodeIds : (m.nodes || []).map(n => n.node_id).sort((a, b) => a - b);
     const v = FP.featurize(by, ids); if (!v) return;
-    state.vecWin.push(v); if (state.vecWin.length > 5) state.vecWin.shift();
-    if (state.vecWin.length === 5) state.curVec = FP.average(state.vecWin);
+    state.vecWin.push(v); if (state.vecWin.length > 100) state.vecWin.shift();
+    const W = state.vecWin; if (W.length >= 5) state.trainVec = FP.average(W.slice(-5));
+    const n = Math.min(W.length, PROFILE().win); if (n >= 5) { state.curVec = FP.average(W.slice(-n)); state.curFill = n / PROFILE().win; }
   }
   function renderFp() {
     const f = state.fp; let t = `${f.spots()} spots · ${f.emptyCount()} empty samples`;
@@ -267,7 +285,7 @@
   function fpMsg(txt) { $('fpMsg').textContent = txt; }
   function startRec(kind, x, y) {
     const live = state.latest && (state.latest.nodes || []).length >= 2;
-    if (!live || !state.curVec) { fpMsg('Need both boards streaming first — wait a few seconds and try again.'); state.armed = false; $('fpSpot').classList.remove('on'); return; }
+    if (!live || !state.trainVec) { fpMsg('Need both boards streaming first — wait a few seconds and try again.'); state.armed = false; $('fpSpot').classList.remove('on'); return; }
     const ids = state.latest.nodes.map(n => n.node_id).sort((a, b) => a - b);
     if (!state.fp.nodeIds.length) state.fp.nodeIds = ids;
     else if (state.fp.nodeIds.join() !== ids.join()) { fpMsg('The set of boards changed since the last recording. Clear training data and start again.'); return; }
@@ -276,9 +294,9 @@
     state.armed = false; $('fpSpot').classList.remove('on');
   }
   function recSample(now) {
-    const r = state.rec; if (!r || !state.curVec || now < r.t0 || now >= r.t1 || now - r.last < 200) return;
+    const r = state.rec; if (!r || !state.trainVec || now < r.t0 || now >= r.t1 || now - r.last < 200) return;
     r.last = now; r.n++;
-    state.fp.add(r.kind === 'empty' ? FP.EMPTY : 'pos', r.x || 0, r.y || 0, state.curVec);
+    state.fp.add(r.kind === 'empty' ? FP.EMPTY : 'pos', r.x || 0, r.y || 0, state.trainVec);
   }
   function recTick(now) {
     const r = state.rec; if (!r) return;
@@ -293,15 +311,20 @@
   }
   function fpPredict() {
     if (state.mode !== 'fingerprint') return;
+    const P = PROFILE();
     if (state.fp.ready() && state.curVec && !state.rec) {
       const r = state.fp.predict(state.curVec);
-      state.fpHist.push(r); if (state.fpHist.length > 8) state.fpHist.shift();
-      const occ = state.fpHist.filter(h => !h.empty && h.x != null);
-      if (occ.length / state.fpHist.length < 0.4) { if (state.fpEst) state.fpEst.s *= 0.85; }
-      else {
-        const mx = occ.reduce((a, h) => a + h.x, 0) / occ.length, my = occ.reduce((a, h) => a + h.y, 0) / occ.length;
-        const sp = occ.reduce((a, h) => a + h.spread, 0) / occ.length;
-        state.fpEst = (state.fpEst && state.fpEst.s > 0.2) ? { x: state.fpEst.x + (mx - state.fpEst.x) * 0.3, y: state.fpEst.y + (my - state.fpEst.y) * 0.3, s: 1, spread: sp } : { x: mx, y: my, s: 1, spread: sp };
+      state.fpHist.push(r); if (state.fpHist.length > P.hist) state.fpHist.shift();
+      state.settling = state.curFill < 1 || state.fpHist.length < P.hist * 0.5;
+      if (!state.settling) {
+        const occ = state.fpHist.filter(h => !h.empty && h.x != null);
+        if (occ.length / state.fpHist.length < 0.5) { if (state.fpEst) state.fpEst.s *= 0.9; }
+        else {
+          const med = a => { const b = a.slice().sort((x, y) => x - y); return b[Math.floor(b.length / 2)]; };
+          const mx = med(occ.map(h => h.x)), my = med(occ.map(h => h.y));      // median: ignores outlier readings
+          const sp = Math.max(med(occ.map(h => h.spread)), med(occ.map(h => Math.hypot(h.x - mx, h.y - my))));
+          state.fpEst = (state.fpEst && state.fpEst.s > 0.2) ? { x: state.fpEst.x + (mx - state.fpEst.x) * P.ema, y: state.fpEst.y + (my - state.fpEst.y) * P.ema, s: 1, spread: sp } : { x: mx, y: my, s: 1, spread: sp };
+        }
       }
     }
     state.est = state.fpEst;
@@ -309,7 +332,7 @@
   $('fpEmpty').onclick = () => startRec('empty', 0, 0) || fpMsg('Leave the room now…');
   $('fpSpot').onclick = () => { state.armed = !state.armed; $('fpSpot').classList.toggle('on', state.armed); fpMsg(state.armed ? 'Stand still where you want to record, then click your position on the map.' : ''); };
   $('fpClear').onclick = () => { if (confirm('Delete all training recordings?')) { state.fp.clear(); state.fp.nodeIds = []; state.fpVal = null; state.fpEst = null; state.fpHist = []; store.set('cc.fp', state.fp.toJSON()); renderFp(); fpMsg('Cleared.'); } };
-  renderFp();
+  renderFp(); applyProfile();
 
   // ---------- distances ----------
   $('rssi0').value = state.pl.rssi0; $('plexp').value = state.pl.n;
@@ -374,7 +397,7 @@
       for (let r = 0; r < GY; r++) for (let c = 0; c < GX; c++) { const v = a[r * GX + c]; if (v > 0.75) { const w = v - 0.75; sw += w; sx += w * (c + 0.5) / GX * W; sy += w * (r + 0.5) / GY * D; } }
       if (sw > 0) {
         const tx = sx / sw, ty = sy / sw, st = Math.min(1, total / 1.2);
-        state.linkEst = state.linkEst ? { x: state.linkEst.x + (tx - state.linkEst.x) * 0.1, y: state.linkEst.y + (ty - state.linkEst.y) * 0.1, s: st } : { x: tx, y: ty, s: st };
+        state.linkEst = state.linkEst ? { x: state.linkEst.x + (tx - state.linkEst.x) * PROFILE().ema, y: state.linkEst.y + (ty - state.linkEst.y) * PROFILE().ema, s: st } : { x: tx, y: ty, s: st };
       }
     } else if (state.linkEst) state.linkEst.s *= 0.92;
     $('routerHint').style.color = routerPos() ? '' : 'var(--warn)';
@@ -436,8 +459,8 @@
   let shown = null;
   function updateCount(raw) {
     if (raw == null) return;
-    hist.push(raw); if (hist.length > 60) hist.shift();
-    if (hist.length < 10) return;
+    hist.push(raw); if (hist.length > PROFILE().cnt) hist.shift();
+    if (hist.length < Math.max(10, PROFILE().cnt * 0.5)) { $('cntNote').textContent = `settling… ${Math.round(hist.length / (PROFILE().cnt * 0.5) * 100)}%`; return; }
     const freq = {}; for (const v of hist) freq[v] = (freq[v] || 0) + 1;
     let best = null, bc = -1; for (const [k, c] of Object.entries(freq)) if (c > bc) { best = +k; bc = c; }
     const stab = bc / hist.length;
@@ -665,7 +688,7 @@
       ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(px, py, rad, 0, 7); ctx.fill();
       ctx.fillStyle = '#ffb84d'; ctx.beginPath(); ctx.arc(px, py, 6, 0, 7); ctx.fill();
       ctx.fillStyle = '#ffb84d'; ctx.font = '11px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-      ctx.fillText(state.mode === 'link' ? 'person (rough area)' : state.mode === 'fingerprint' ? 'person (trained)' : 'presence (approx.)', px, py - 12);
+      ctx.fillText(state.mode === 'link' ? 'person (rough area)' : state.mode === 'fingerprint' ? (state.settling ? 'person (settling…)' : 'person (trained)') : 'presence (approx.)', px, py - 12);
     }
 
     // training spots (green = usable, red = blind spot) and the recording ring
