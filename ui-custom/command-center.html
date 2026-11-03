@@ -81,6 +81,14 @@
       <div><label for="roomD">Depth (y)</label><input id="roomD" type="number" min="1" max="30" step="0.1"></div>
     </div>
 
+    <h2>Person location</h2>
+    <label for="mode">Method</label>
+    <select id="mode" style="width:100%">
+      <option value="link">Link model (router → boards)</option>
+      <option value="server">Server signal field</option>
+    </select>
+    <div class="hint" id="routerHint" style="margin-top:6px">Place the <b>Router</b> object where your router really is. Each board's link runs from the router to that board; the person is placed where the disturbed links point.</div>
+
     <h2>Layout</h2>
     <div class="row">
       <button id="btnExport">Export</button>
@@ -149,6 +157,11 @@
     lastClass: null,
     amp: {},                // node_id -> amplitude history
     lastMsg: 0,
+    mode: store.get('cc.mode', 'link'),
+    mbp: {},
+    score: {},
+    link: null,
+    linkEst: null,
   };
   const save = () => { store.set('cc.room', state.room); store.set('cc.objects', state.objects); store.set('cc.nodePos', state.nodePos); };
 
@@ -201,6 +214,52 @@
     $('iDel').onclick = () => { state.objects = state.objects.filter(x => x !== o); state.selected = null; save(); renderInspector(); };
   }
   renderInspector();
+
+  // ---------- location method ----------
+  $('mode').value = state.mode;
+  $('mode').onchange = e => { state.mode = e.target.value; store.set('cc.mode', state.mode); state.est = null; };
+
+  function routerPos() { const r = state.objects.find(o => o.type === 'router'); return r ? [r.x, r.y] : null; }
+  function pctl(arr, q) { const a = arr.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(q * a.length))]; }
+  function distSeg(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy || 1e-9;
+    const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2));
+    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+  }
+  // Each board hears the router; a person near that router->board line disturbs it most.
+  function updateLinkModel(m) {
+    for (const nf of (m.node_features || [])) {
+      const h = state.mbp[nf.node_id] || (state.mbp[nf.node_id] = []);
+      h.push(nf.features.motion_band_power); if (h.length > 400) h.shift();
+      if (h.length < 40) { state.score[nf.node_id] = 0; continue; }
+      const lo = pctl(h, 0.2), hi = pctl(h, 0.95);
+      state.score[nf.node_id] = Math.max(0, Math.min(1, (nf.features.motion_band_power - lo) / (hi - lo + 1e-6)));
+    }
+    const rp = routerPos() || [0, 0];
+    const GX = 40, GY = 30, W = state.room.w, D = state.room.d, sigma = 0.7;
+    const a = new Float32Array(GX * GY); let mx = 0;
+    const nodes = m.nodes || [];
+    for (let r = 0; r < GY; r++) for (let c = 0; c < GX; c++) {
+      const x = (c + 0.5) / GX * W, y = (r + 0.5) / GY * D; let L = 0;
+      for (const n of nodes) {
+        const np = nodePos(n), d = distSeg(x, y, rp[0], rp[1], np[0], np[1]);
+        L += (state.score[n.node_id] || 0) * Math.exp(-(d * d) / (2 * sigma * sigma));
+      }
+      a[r * GX + c] = L; if (L > mx) mx = L;
+    }
+    const total = nodes.reduce((t, n) => t + (state.score[n.node_id] || 0), 0);
+    if (mx > 0) for (let i = 0; i < a.length; i++) a[i] /= mx;
+    state.link = { a, gx: GX, gy: GY, total };
+    if (total > 0.3) {
+      let sw = 0, sx = 0, sy = 0;
+      for (let r = 0; r < GY; r++) for (let c = 0; c < GX; c++) { const v = a[r * GX + c]; if (v > 0.75) { const w = v - 0.75; sw += w; sx += w * (c + 0.5) / GX * W; sy += w * (r + 0.5) / GY * D; } }
+      if (sw > 0) {
+        const tx = sx / sw, ty = sy / sw, st = Math.min(1, total / 1.2);
+        state.linkEst = state.linkEst ? { x: state.linkEst.x + (tx - state.linkEst.x) * 0.1, y: state.linkEst.y + (ty - state.linkEst.y) * 0.1, s: st } : { x: tx, y: ty, s: st };
+      }
+    } else if (state.linkEst) state.linkEst.s *= 0.92;
+    $('routerHint').style.color = routerPos() ? '' : 'var(--warn)';
+  }
 
   // ---------- room size ----------
   $('roomW').value = state.room.w; $('roomD').value = state.room.d;
@@ -310,6 +369,9 @@
       } else if (state.est) state.est.s *= 0.9;
     }
 
+    updateLinkModel(m);
+    if (state.mode === 'link') state.est = state.linkEst;
+
     // headline
     const ri = m.room_inference || {};
     const cls = ri.classification || (m.classification && m.classification.motion_level) || 'unknown';
@@ -388,12 +450,14 @@
   function roundRect(c, x, y, w, h, r) { c.beginPath(); c.roundRect ? c.roundRect(x, y, w, h, r) : c.rect(x, y, w, h); }
 
   function drawHeat(v) {
-    if (!state.field) return;
-    const [gx, gy] = state.fieldDims;
+    const useLink = state.mode === 'link';
+    const src = useLink ? (state.link && state.link.a) : state.field;
+    if (!src) return;
+    const [gx, gy] = useLink ? [state.link.gx, state.link.gy] : state.fieldDims;
     if (heat.width !== gx || heat.height !== gy) { heat.width = gx; heat.height = gy; }
     const img = hctx.createImageData(gx, gy);
     for (let i = 0; i < gx * gy; i++) {
-      const t = Math.max(0, Math.min(1, state.field[i]));
+      const t = Math.max(0, Math.min(1, src[i]));
       // blue -> teal -> amber ramp; alpha grows with intensity so quiet areas stay clear
       const r = t < 0.5 ? 27 + t * 2 * (54 - 27) : 54 + (t - 0.5) * 2 * (255 - 54);
       const g = t < 0.5 ? 59 + t * 2 * (214 - 59) : 214 + (t - 0.5) * 2 * (184 - 214);
@@ -448,13 +512,13 @@
     const nodes = state.latest ? state.latest.nodes || [] : [];
     const live = performance.now() - state.lastMsg < 3000;
 
-    // links between node pairs
-    for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
-      const a = toPx(v, ...nodePos(nodes[i]).slice(0, 2)), b = toPx(v, ...nodePos(nodes[j]).slice(0, 2));
-      const rssi = Math.min(nodes[i].rssi_dbm, nodes[j].rssi_dbm);
-      const q = Math.max(0, Math.min(1, (rssi + 90) / 55));
+    // links: router -> each board (that is what each board actually measures)
+    const rp = routerPos();
+    if (rp) for (const n of nodes) {
+      const a = toPx(v, rp[0], rp[1]), b = toPx(v, ...nodePos(n).slice(0, 2));
+      const q = Math.max(0, Math.min(1, (n.rssi_dbm + 90) / 55)), d = state.score[n.node_id] || 0;
       ctx.save(); ctx.setLineDash([8, 8]); ctx.lineDashOffset = -(now / 40) % 16;
-      ctx.strokeStyle = `rgba(54,214,164,${live ? 0.25 + q * 0.5 : 0.1})`; ctx.lineWidth = 1 + q * 2;
+      ctx.strokeStyle = d > 0.5 ? `rgba(255,184,77,${0.4 + d * 0.5})` : `rgba(54,214,164,${live ? 0.2 + q * 0.4 : 0.1})`; ctx.lineWidth = 1 + q * 2 + d * 2;
       ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke(); ctx.restore();
     }
 
@@ -462,13 +526,13 @@
     if (live && state.est && state.est.s > 0.05) {
       const [px, py] = toPx(v, state.est.x, state.est.y);
       const pulse = 1 + 0.15 * Math.sin(now / 250);
-      const rad = (0.35 + state.est.s * 0.5) * v.s * pulse;
+      const rad = (state.mode === 'link' ? 0.9 : 0.35 + state.est.s * 0.5) * v.s * pulse;
       const gr = ctx.createRadialGradient(px, py, 0, px, py, rad);
       gr.addColorStop(0, 'rgba(255,184,77,0.55)'); gr.addColorStop(1, 'rgba(255,184,77,0)');
       ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(px, py, rad, 0, 7); ctx.fill();
       ctx.fillStyle = '#ffb84d'; ctx.beginPath(); ctx.arc(px, py, 6, 0, 7); ctx.fill();
       ctx.fillStyle = '#ffb84d'; ctx.font = '11px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-      ctx.fillText('presence (approx.)', px, py - 12);
+      ctx.fillText(state.mode === 'link' ? 'person (rough area)' : 'presence (approx.)', px, py - 12);
     }
 
     // nodes
